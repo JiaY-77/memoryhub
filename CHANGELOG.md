@@ -4,6 +4,16 @@
 
 版本格式：`主版本.次版本.修订号`。发布流程见 [RELEASING.md](docs/RELEASING.md)。
 
+## [Unreleased] - 2026-09-06
+
+### 依赖
+
+- **triviumdb 0.8.5 → 0.8.6**：上游大版本（tiered payloads + composable analytics + 服务端加固 + 发布治理）。存储格式 v7 → v9（payload 迁至 generation-scoped mmap sidecar `.pld.<gen>`，flush marker v3），打开旧库自动兼容、flush/close 时自动升级（MINIMUM_SUPPORTED_VERSION 仍为 5，早于 0.7.0 的文件需手动迁移）。本地零手工迁移：备份 `data/backup_20260906` → 副本冒烟（v7 打开/flush 升 v9/重开验证）→ 真实库由服务打开自动升级。我们提的 #39（SEARCH VECTOR 科学计数法解析）与 #40（FIND 范围/复合谓词慢）上游已标 solved 并验证：科学计数法 30/30 全过；复合谓词同库 A/B 2.0ms→0.6ms（约 3.3x）。测试断言随格式更新（storage_info database_format_current 7→9）
+
+### 测试
+
+- 全量 **167 passed + 2 xfailed + 2 xpassed**（依赖升级后无新增失败，仅版本断言 0.8.5→0.8.6 与 format 7→9 更新）
+
 ## [1.1.1] - 2026-09-05
 
 ### 安全

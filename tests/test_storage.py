@@ -52,8 +52,8 @@ def tdb(_dir):
 def test_storage_info_metadata(tdb):
     info = tdb.storage_info()
     assert isinstance(info, dict)
-    assert info["package_version"] == "0.8.5"
-    assert info["database_format_current"] == 7
+    assert info["package_version"] == "0.8.6"
+    assert info["database_format_current"] == 9
     assert info["database_format_minimum"] <= info["database_format_current"]
     assert info["access_mode"] in ("read_write", "read_only", "immutable")
     assert "sidecars" in info and isinstance(info["sidecars"], dict)
