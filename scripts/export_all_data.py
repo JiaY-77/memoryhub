@@ -3,21 +3,23 @@
 Palimpsest 全量数据导出脚本（只读）
 ====================================
 导出 TriviumDB 中所有节点的 payload（元数据）和全部边（图谱关系）为 JSON 备份，
-用于 triviumdb 0.6.0 → 0.7.6 升级（存储格式不兼容，旧库无法直接打开）后的重建。
+用于跨版本升级（存储格式不兼容、旧库无法直接打开）后的重建。
 
 - 只导出 payload + edges，不导出向量（重建时重新生成）。
 - 边按 (source_id, target_id, label) 去重；REVISED_BY 单向、RELATED_TO 双向协议
   会存两条反向边——原样导出，重建时按 label 语义处理。
-- 全程只读，不修改数据库（连读失败时仅复制快照到系统临时目录后解析）。
+- 全程只读，不修改数据库。
 
-两种读取模式（自动选择）：
-  1. TriviumStore API —— 数据库未被其他进程占用时使用。
-  2. 二进制快照解析   —— 数据库被运行中的 MCP 服务锁定（.lock 存在且被持有）、
-     triviumdb 无法开库时，直接解析 triviumdb 0.6.0 的文件格式（已与服务器
-     graph_neighbors / mem_recent 实测交叉验证一致）：
-       - 节点记录: [u32 id][u32 vec_block][u32 payload_len][payload JSON]
-       - 边记录:   [u64 source_id][u64 target_id][u16 label_len][label][f32 weight]
-       边表起始偏移 = 文件头 u32 @ 42。
+读取方式（仅一种，TriviumStore API）：
+  单连接内遍历全部节点与边。triviumdb 0.8.6 起同一进程禁止嵌套双开连接
+  （遍历迭代器持有连接时再 _acquire 新连接会报 Database locked），
+  故节点读取与边读取共用同一 db 连接。
+  若数据库被其他进程（REST/MCP）占用导致 API 不可用，请先停止服务再运行；
+  或直接物理复制 data/ 目录备份（推荐，最简单可靠）。
+
+  历史说明：v0.8.6 之前的「二进制快照解析」兜底（直接解析 .db 主文件内嵌
+  payload）已退役——0.8.6 把 payload 迁至 .pld.<gen> sidecar，主文件不再
+  内嵌 payload，旧解析必然失败。
 
 运行：
     venv/Scripts/python.exe scripts/export_all_data.py
@@ -28,10 +30,6 @@ Palimpsest 全量数据导出脚本（只读）
 
 import json
 import os
-import shutil
-import struct
-import sys
-import tempfile
 from collections import Counter
 
 # 确保能 import 项目 core 模块（以项目根为基准，_common 导入即把项目根注入 sys.path）
@@ -44,153 +42,54 @@ DB_FILE = "data/mh_memory.db"
 
 
 # --------------------------------------------------------------------------
-# 模式一：TriviumStore API
+# 模式一：TriviumStore API（唯一模式，单连接遍历）
 # --------------------------------------------------------------------------
 def export_via_store(store: TriviumStore) -> dict:
-    """用官方 API 遍历节点与边（库未被占用时）。"""
+    """用官方 API 遍历节点与边（单连接内完成，适配 triviumdb 0.8.6）。
+
+    0.8.6 起同进程禁止嵌套双开连接：iter 类遍历（iter_nodes/iter_payloads）
+    持有的连接在迭代器耗尽前不会释放，若在循环体内再调 store.get_edges()
+    （内部 _acquire 新连接）会报 Database locked。故此处不借助 iter_nodes +
+    store.get_edges 的组合，而是在一个 db 连接内 all_node_ids + get +
+    get_edges 全部完成。
+    """
     nodes = []
     edges = []
     seen_edges = set()
     type_counter = Counter()
     label_counter = Counter()
 
-    for nid, node in store.iter_nodes():
-        if not node or not (node.get("payload") or {}):
-            print(f"  警告: 节点 {nid} 读取失败，跳过")
-            continue
-        payload = node.get("payload") or {}
-        nodes.append({"node_id": nid, "payload": payload})
-        type_counter[payload.get("type", "unknown")] += 1
-
-        for edge in store.get_edges(nid):
-            source_id = getattr(edge, "source_id", None) or nid
-            target_id = edge.target_id
-            label = getattr(edge, "label", "")
-            weight = getattr(edge, "weight", None)
-            key = (source_id, target_id, label)
-            if key in seen_edges:
+    db = store._acquire()
+    try:
+        for nid in db.all_node_ids():
+            node = db.get(nid)
+            if not node or not (node.payload or {}):
+                print(f"  警告: 节点 {nid} 读取失败，跳过")
                 continue
-            seen_edges.add(key)
-            edges.append(
-                {"source_id": source_id, "target_id": target_id,
-                 "label": label, "weight": weight}
-            )
-            label_counter[label] += 1
+            payload = node.payload or {}
+            nodes.append({"node_id": nid, "payload": payload})
+            type_counter[payload.get("type", "unknown")] += 1
 
-    return {
-        "nodes": nodes, "edges": edges,
-        "stats": {
-            "node_total": len(nodes),
-            "type_counts": dict(type_counter),
-            "edge_total": len(edges),
-            "label_counts": dict(label_counter),
-        },
-    }
-
-
-# --------------------------------------------------------------------------
-# 模式二：二进制快照解析（triviumdb 0.6.0 文件格式）
-# --------------------------------------------------------------------------
-def _snapshot_db() -> str:
-    """把 .db 复制到系统临时目录（只读原库），返回快照路径。"""
-    snap_dir = os.path.join(tempfile.gettempdir(), "mh_export_backup")
-    os.makedirs(snap_dir, exist_ok=True)
-    snap = os.path.join(snap_dir, "mh_memory.db")
-    for attempt in range(1, 6):
-        shutil.copy2(DB_FILE, snap)
-        with open(snap, "rb") as f:
-            head = f.read(4)
-        if head == b"TVDB":
-            return snap
-        print(f"  快照校验失败（头 {head!r}），重试 {attempt}/5 ...")
-    raise RuntimeError("无法获得一致的数据文件快照")
-
-
-def export_via_binary_snapshot() -> dict:
-    """数据库被占用时，解析 .db 文件快照（仅 payload/edges 所在区段）。"""
-    import re as _re
-
-    snap = _snapshot_db()
-    with open(snap, "rb") as f:
-        d = f.read()
-    print(f"  快照: {snap} ({len(d)} bytes)")
-
-    # 1. 边表偏移 = 文件头 u32 @ 42（0x2A），随文件重写变化，动态读取
-    if len(d) < 46:
-        raise RuntimeError("文件过短，非有效 triviumdb 文件")
-    edge_off = struct.unpack_from("<I", d, 42)[0]
-    if not (100 < edge_off < len(d)):
-        raise RuntimeError(f"边表偏移异常: {edge_off} (file={len(d)})")
-
-    # 2. 锚点法收集节点：所有 '{"' 位置，校验 [id u32][vec u32][len u32] 前缀 + JSON
-    anchors = []  # (pos, id, vec_block, plen, payload)
-    for m in _re.finditer(rb'\{"', d):
-        j = m.start()
-        if j < 12 or j >= edge_off:
-            continue
-        nid, vec, plen = struct.unpack_from("<III", d, j - 12)
-        if not (0 < plen < 5_000_000) or j + plen > edge_off:
-            continue
+            for edge in db.get_edges(nid) or []:
+                source_id = getattr(edge, "source_id", None) or nid
+                target_id = edge.target_id
+                label = getattr(edge, "label", "")
+                weight = getattr(edge, "weight", None)
+                key = (source_id, target_id, label)
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                edges.append(
+                    {"source_id": source_id, "target_id": target_id,
+                     "label": label, "weight": weight}
+                )
+                label_counter[label] += 1
+    finally:
         try:
-            obj = json.loads(d[j:j + plen])
+            db.close()
         except Exception:
-            continue
-        if isinstance(obj, dict):
-            anchors.append((j, nid, vec, plen, obj))
-    anchors.sort()
-    if not anchors:
-        raise RuntimeError("节点表解析失败：未找到任何有效载荷记录")
+            pass
 
-    # 3. 连续性校验（容忍零填充墓碑间隙）
-    nodes = []
-    prev_end = None
-    for k, (j, nid, vec, plen, payload) in enumerate(anchors):
-        if prev_end is not None and j != prev_end:
-            gap = d[prev_end:j]
-            if gap and any(gap):
-                print(f"  警告: 锚点 {k} 前存在非零间隙 {len(gap)}B（可能漏节点）")
-            # 零填充 = 删除节点墓碑，跳过
-        nodes.append({"node_id": nid, "payload": payload})
-        prev_end = j + 12 + plen
-
-    # 4. 边记录: [src u64][dst u64][llen u16][label][weight f32]
-    edges = []
-    pos = edge_off
-    while pos + 18 <= len(d):
-        src, dst, llen = struct.unpack_from("<QQH", d, pos)
-        end = pos + 18 + llen
-        if not (0 < llen <= 200) or end + 4 > len(d):
-            break  # 边表结束（后续为向量块表/校验区）
-        label = d[pos + 18:end].decode("utf-8", "replace")
-        weight = struct.unpack_from("<f", d, end)[0]
-        edges.append({"source_id": src, "target_id": dst,
-                      "label": label, "weight": weight})
-        pos = end + 4
-
-    # 5. 去重（按 source_id, target_id, label）
-    seen = set()
-    dedup = []
-    for e in edges:
-        key = (e["source_id"], e["target_id"], e["label"])
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(e)
-    edges = dedup
-
-    # 6. 校验：边端点应都在节点集合中
-    node_ids = set(n["node_id"] for n in nodes)
-    orphans = set()
-    for e in edges:
-        if e["source_id"] not in node_ids:
-            orphans.add(e["source_id"])
-        if e["target_id"] not in node_ids:
-            orphans.add(e["target_id"])
-    if orphans:
-        print(f"  警告: {len(orphans)} 个边端点不在节点表中: {sorted(orphans)[:10]}")
-
-    type_counter = Counter(n["payload"].get("type", "unknown") for n in nodes)
-    label_counter = Counter(e["label"] for e in edges)
     return {
         "nodes": nodes, "edges": edges,
         "stats": {
@@ -201,6 +100,14 @@ def export_via_binary_snapshot() -> dict:
         },
     }
 
+
+# --------------------------------------------------------------------------
+# 模式二（已退役）：二进制快照解析
+# 说明：triviumdb 0.6.0 时代的 payload 内嵌在 .db 主文件，可绕过 API 直接解析。
+# 0.8.6 起 payload 迁至 .pld.<gen> mmap sidecar，主文件不再内嵌 payload，
+# 旧解析逻辑必然失败，故退役（函数已删除）。需要备份时请停服务后物理复制
+# data/ 目录。
+# --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
 def main() -> None:
@@ -208,14 +115,16 @@ def main() -> None:
     print(f"数据库: {store.db_path}")
     print("开始导出（只读）...")
 
-    mode = "TriviumStore API"
+    mode = "TriviumStore API（单连接）"
     try:
         data = export_via_store(store)
     except RuntimeError as e:
         print(f"  TriviumStore API 不可用（{e}）")
-        print("  回退到二进制快照解析模式...")
-        data = export_via_binary_snapshot()
-        mode = "二进制快照解析（triviumdb 0.6.0 格式）"
+        print("  提示: 数据库可能被 REST/MCP 服务占用。请先停止服务后重试，")
+        print("  或直接物理复制 data/ 目录备份（含 .db/.vec/.pld.*/.fts.db）。")
+        print("  （旧版 export_all_data.py 的二进制快照兜底已在 triviumdb 0.8.6")
+        print("   适配中退役——payload 迁至 .pld sidecar 后主文件不再内嵌 payload）")
+        raise
 
     # 写 JSON（ensure_ascii=False 保留中文）
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
